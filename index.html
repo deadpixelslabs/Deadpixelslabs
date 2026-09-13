@@ -246,7 +246,7 @@
         </div>
 
         <div class="notice">
-          <strong>Manual wallet only.</strong> This site never auto-connects, never requests a signature on page load, and never asks for a seed phrase or private key. The wallet transaction appears only after your GPU finds a valid proof and you choose to claim it.
+          <strong>Manual wallet only.</strong> This site never auto-connects, never requests a signature on page load, and never asks for a seed phrase or private key. The wallet transaction appears only after your GPU finds a valid proof and you choose to claim it. Chain sync runs independently in the background so RPC latency does not pause GPU hashing.
         </div>
       </div>
     </div>
@@ -404,6 +404,12 @@ let selectedDP = null, selectedVerified = false;
 let currentChallenge = ethers.ZeroHash, currentTarget = 0n, currentDifficulty = 0n;
 let hashesTested = 0n, nonceCursor = 0n, batchSize = 32768, lastHashrate = 0;
 let pendingWinner = null, lastChainRead = 0;
+let miningGeneration = 0;
+let syncGeneration = 0;
+let rateWindowStart = 0;
+let rateWindowHashes = 0n;
+let lastMiningUi = 0;
+const PIPELINE_DEPTH = 3;
 
 function log(msg, cls=""){
   const d=document.createElement("div");
@@ -493,7 +499,7 @@ async function initReadOnly(){
   log("HASHPIXELS miner booting…");
   log("Read-only mode. Wallet has NOT been accessed.","muted");
   await Promise.allSettled([refreshChain(false), loadLatestMints(), initGPU()]);
-  setInterval(()=>{ if(!mining) refreshChain(true).catch(()=>{}); },5000);
+  setInterval(()=>{ if(!mining) refreshChain(true).catch(()=>{}); },8000);
 }
 async function switchRobinhood(provider){
   if(!provider) throw new Error("No injected EVM wallet detected. Please enable/install OKX Wallet and refresh the page.");
@@ -532,6 +538,11 @@ async function connectWallet(){
 
     deadPixelsWrite=new ethers.Contract(DEAD_PIXELS,DEAD_PIXELS_ABI,signer);
 
+    // Use the connected wallet's RPC for live reads after connection.
+    // This avoids browser CORS / public RPC fetch failures during long mining sessions.
+    hashpixelsRead=new ethers.Contract(HASHPIXELS,HASHPIXELS_ABI,walletProvider);
+    deadPixelsRead=new ethers.Contract(DEAD_PIXELS,DEAD_PIXELS_ABI,walletProvider);
+
     btn.textContent=short(walletAddress,6,4);
     log("Wallet connected by explicit user action: "+walletAddress,"good");
 
@@ -554,6 +565,29 @@ async function connectWallet(){
     if(!walletAddress && btn.textContent==="CONNECTING…") btn.textContent=original;
   }
 }
+async function refreshMiningState(){
+  // Lightweight sync used while the GPU is hashing.
+  // Only read values that can invalidate the current search.
+  try{
+    const [challenge,target] = await Promise.all([
+      hashpixelsRead.currentChallenge(),
+      hashpixelsRead.getFunction("target").staticCall()
+    ]);
+    currentChallenge=challenge;
+    currentTarget=target;
+    lastChainRead=Date.now();
+    $("challengeLine").textContent="challenge: "+challenge;
+    $("challengeFull").textContent=challenge;
+    $("targetShort").textContent=short("0x"+target.toString(16).padStart(64,"0"),10,8);
+    return {challenge,target};
+  }catch(e){
+    // A temporary RPC hiccup should never stop GPU hashing.
+    // Keep mining the last known challenge and retry later.
+    lastChainRead=Date.now()-1500;
+    throw e;
+  }
+}
+
 async function refreshChain(silent=true){
   try{
     const [active,challenge,target,mined,remaining,diff,bn]=await Promise.all([
@@ -671,8 +705,8 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
   h[0]=bswap(s[0].x);h[1]=bswap(s[0].y);h[2]=bswap(s[1].x);h[3]=bswap(s[1].y);
   h[4]=bswap(s[2].x);h[5]=bswap(s[2].y);h[6]=bswap(s[3].x);h[7]=bswap(s[3].y);
   if(isValid(&h)){
-    let won=atomicCompareExchangeWeak(&result.found,0u,1u);
-    if(won.exchanged){result.nonceLo=lo;result.nonceHi=hi;result.h0=h[0];result.h1=h[1];result.h2=h[2];result.h3=h[3];result.h4=h[4];result.h5=h[5];result.h6=h[6];result.h7=h[7];}
+    let old=atomicMax(&result.found,1u);
+    if(old==0u){result.nonceLo=lo;result.nonceHi=hi;result.h0=h[0];result.h1=h[1];result.h2=h[2];result.h3=h[3];result.h4=h[4];result.h5=h[5];result.h6=h[6];result.h7=h[7];}
   }
 }`;
 
@@ -691,20 +725,47 @@ async function initGPU(){
     const ci=await module.getCompilationInfo();
     const errs=ci.messages.filter(x=>x.type==="error");
     if(errs.length)throw new Error(errs.map(x=>`${x.lineNum}:${x.linePos} ${x.message}`).join("\n"));
-    const pipeline=await device.createComputePipelineAsync({layout:"auto",compute:{module,entryPoint:"main"}});
+
+    const pipeline=await device.createComputePipelineAsync({
+      layout:"auto",
+      compute:{module,entryPoint:"main"}
+    });
+
     const u=GPUBufferUsage;
-    const baseBuffer=device.createBuffer({size:136,usage:u.STORAGE|u.COPY_DST});
-    const targetBuffer=device.createBuffer({size:32,usage:u.STORAGE|u.COPY_DST});
-    const paramsBuffer=device.createBuffer({size:16,usage:u.UNIFORM|u.COPY_DST});
-    const resultBuffer=device.createBuffer({size:44,usage:u.STORAGE|u.COPY_SRC|u.COPY_DST});
-    const readBuffer=device.createBuffer({size:44,usage:u.COPY_DST|u.MAP_READ});
-    const bindGroup=device.createBindGroup({layout:pipeline.getBindGroupLayout(0),entries:[
-      {binding:0,resource:{buffer:baseBuffer}},{binding:1,resource:{buffer:targetBuffer}},
-      {binding:2,resource:{buffer:paramsBuffer}},{binding:3,resource:{buffer:resultBuffer}}
-    ]});
-    gpu={adapter,device,pipeline,baseBuffer,targetBuffer,paramsBuffer,resultBuffer,readBuffer,bindGroup};
-    $("gpuName").textContent=label.toUpperCase();
-    log("WebGPU ready: "+label,"good");
+    const slots=[];
+
+    // Triple-buffered result/readback pipeline:
+    // while CPU reads slot A, GPU can already execute slots B/C.
+    for(let i=0;i<PIPELINE_DEPTH;i++){
+      const baseBuffer=device.createBuffer({size:136,usage:u.STORAGE|u.COPY_DST});
+      const targetBuffer=device.createBuffer({size:32,usage:u.STORAGE|u.COPY_DST});
+      const paramsBuffer=device.createBuffer({size:16,usage:u.UNIFORM|u.COPY_DST});
+      const resultBuffer=device.createBuffer({size:44,usage:u.STORAGE|u.COPY_SRC|u.COPY_DST});
+      const readBuffer=device.createBuffer({size:44,usage:u.COPY_DST|u.MAP_READ});
+      const bindGroup=device.createBindGroup({
+        layout:pipeline.getBindGroupLayout(0),
+        entries:[
+          {binding:0,resource:{buffer:baseBuffer}},
+          {binding:1,resource:{buffer:targetBuffer}},
+          {binding:2,resource:{buffer:paramsBuffer}},
+          {binding:3,resource:{buffer:resultBuffer}}
+        ]
+      });
+      slots.push({baseBuffer,targetBuffer,paramsBuffer,resultBuffer,readBuffer,bindGroup,index:i});
+    }
+
+    gpu={adapter,device,pipeline,slots,label};
+
+    device.lost.then(info=>{
+      log("WebGPU device lost: "+(info?.message||info?.reason||"unknown"),"bad");
+      if(mining) stopMining(false);
+      gpu=null;
+      $("gpuName").textContent="GPU LOST";
+      updateButtons();
+    });
+
+    $("gpuName").textContent=label.toUpperCase()+" · PIPELINED";
+    log("WebGPU ready: "+label+" · triple-buffer pipeline enabled","good");
     updateButtons();
   }catch(e){
     $("gpuName").textContent="GPU ERROR";
@@ -713,31 +774,84 @@ async function initGPU(){
 }
 function powerSettings(){
   const mode=$("powerMode").value;
-  if(mode==="low")return{max:131072,targetMs:65};
-  if(mode==="max")return{max:1048576,targetMs:170};
-  return{max:524288,targetMs:115};
+  // Shorter dispatches keep the browser responsive; triple buffering keeps GPU fed.
+  if(mode==="low")return{max:131072,targetMs:24};
+  if(mode==="max")return{max:1048576,targetMs:55};
+  return{max:524288,targetMs:38};
 }
-async function runBatch(challenge,target,start,count,dpId){
+
+function submitBatch(slot,challenge,target,start,count,dpId,generation){
   const {device}=gpu;
-  device.queue.writeBuffer(gpu.baseBuffer,0,packRateBlock(challenge,walletAddress,dpId));
-  device.queue.writeBuffer(gpu.targetBuffer,0,targetWords(target));
+
+  device.queue.writeBuffer(slot.baseBuffer,0,packRateBlock(challenge,walletAddress,dpId));
+  device.queue.writeBuffer(slot.targetBuffer,0,targetWords(target));
+
   const p=u64parts(start);
-  device.queue.writeBuffer(gpu.paramsBuffer,0,new Uint32Array([p.lo,p.hi,count,0]));
-  device.queue.writeBuffer(gpu.resultBuffer,0,new Uint32Array(11));
+  device.queue.writeBuffer(slot.paramsBuffer,0,new Uint32Array([p.lo,p.hi,count,0]));
+  device.queue.writeBuffer(slot.resultBuffer,0,new Uint32Array(11));
+
   const encoder=device.createCommandEncoder();
   const pass=encoder.beginComputePass();
-  pass.setPipeline(gpu.pipeline);pass.setBindGroup(0,gpu.bindGroup);pass.dispatchWorkgroups(Math.ceil(count/WORKGROUP));pass.end();
-  encoder.copyBufferToBuffer(gpu.resultBuffer,0,gpu.readBuffer,0,44);
-  const t0=performance.now();device.queue.submit([encoder.finish()]);
-  await gpu.readBuffer.mapAsync(GPUMapMode.READ);
-  const t1=performance.now();
-  const copy=new Uint32Array(gpu.readBuffer.getMappedRange().slice(0));gpu.readBuffer.unmap();
-  if(copy[0]===1){
-    const nonce=(BigInt(copy[2])<<32n)|BigInt(copy[1]);
-    return{ms:t1-t0,nonce,hash:hashWordsToHex(copy.slice(3,11))};
-  }
-  return{ms:t1-t0,nonce:null,hash:null};
+  pass.setPipeline(gpu.pipeline);
+  pass.setBindGroup(0,slot.bindGroup);
+  pass.dispatchWorkgroups(Math.ceil(count/WORKGROUP));
+  pass.end();
+  encoder.copyBufferToBuffer(slot.resultBuffer,0,slot.readBuffer,0,44);
+
+  const submittedAt=performance.now();
+  device.queue.submit([encoder.finish()]);
+
+  // mapAsync waits for this slot only. Other slots may remain queued/running.
+  const promise=slot.readBuffer.mapAsync(GPUMapMode.READ).then(()=>{
+    const finishedAt=performance.now();
+    const copy=new Uint32Array(slot.readBuffer.getMappedRange().slice(0));
+    slot.readBuffer.unmap();
+
+    let nonce=null,hash=null;
+    if(copy[0]===1){
+      nonce=(BigInt(copy[2])<<32n)|BigInt(copy[1]);
+      hash=hashWordsToHex(copy.slice(3,11));
+    }
+
+    return {
+      slot,
+      generation,
+      challenge,
+      target,
+      start,
+      count,
+      dpId,
+      nonce,
+      hash,
+      elapsed:finishedAt-submittedAt
+    };
+  });
+
+  return {slot,promise,generation,challenge,target,start,count,dpId};
 }
+
+function tuneBatchSize(){
+  if(!lastHashrate)return;
+  const settings=powerSettings();
+  const desired=Math.round(lastHashrate*(settings.targetMs/1000));
+  const clamped=Math.max(4096,Math.min(settings.max,desired));
+  batchSize=Math.max(WORKGROUP,Math.floor(clamped/WORKGROUP)*WORKGROUP);
+}
+
+function updateMiningUiSmooth(force=false){
+  const now=performance.now();
+  if(!force && now-lastMiningUi<250)return;
+  lastMiningUi=now;
+
+  $("hashrate").textContent=formatRate(lastHashrate);
+  $("tested").textContent=fmt(hashesTested.toString());
+  $("batchMs").textContent=lastHashrate
+    ? "~"+((batchSize/lastHashrate)*1000).toFixed(1)+" ms"
+    : "— ms";
+  $("batchBar").style.width=mining?"100%":"0%";
+  updateProbability();
+}
+
 async function startMining(){
   if(mining)return;
   if(!walletAddress)return log("Connect wallet first.","warn");
@@ -747,77 +861,231 @@ async function startMining(){
     return;
   }
   if(!gpu)return log("WebGPU is not ready.","bad");
+
   const state=await refreshChain(true);
   if(!state.active)return log("Mining is not activated on-chain yet.","warn");
-  // Re-check ownership immediately before work starts.
+
   const owner=await deadPixelsRead.ownerOf(selectedDP);
-  if(owner.toLowerCase()!==walletAddress.toLowerCase()){selectedVerified=false;updateButtons();return log("Selected DEAD PIXELS is no longer owned by this wallet.","bad");}
-  mining=true;hashesTested=0n;nonceCursor=rand64();lastHashrate=0;
-  $("minerState").textContent="▪ MINING";$("minerState").style.color="#071006";
+  if(owner.toLowerCase()!==walletAddress.toLowerCase()){
+    selectedVerified=false;updateButtons();
+    return log("Selected DEAD PIXELS is no longer owned by this wallet.","bad");
+  }
+
+  mining=true;
+  miningGeneration++;
+  hashesTested=0n;
+  nonceCursor=rand64();
+  lastHashrate=0;
+  batchSize=32768;
+  rateWindowStart=performance.now();
+  rateWindowHashes=0n;
+  lastMiningUi=0;
+
+  $("minerState").textContent="▪ MINING";
+  $("minerState").style.color="#071006";
+  $("batchBar").style.width="100%";
+
   log("REAL WebGPU mining started.","good");
+  log("Smooth continuous mode: triple-buffer GPU pipeline + background challenge sync.","good");
   log("Fuel: DEAD PIXELS #"+selectedDP+". It will NOT be transferred unless you find a valid proof and confirm claim.","muted");
-  updateButtons();miningLoop();
+
+  updateButtons();
+
+  const generation=miningGeneration;
+  miningStateWatcher(generation);
+  miningLoop(generation);
 }
+
 function stopMining(withLog=true){
+  if(!mining && !withLog)return;
   mining=false;
-  $("minerState").textContent="▪ IDLE";$("minerState").style.color="";
+  miningGeneration++;
+  syncGeneration++;
+  $("minerState").textContent="▪ IDLE";
+  $("minerState").style.color="";
   $("batchBar").style.width="0";
+  updateMiningUiSmooth(true);
   updateButtons();
   if(withLog)log("Mining stopped.","warn");
 }
-async function miningLoop(){
-  while(mining){
+
+async function miningStateWatcher(generation){
+  const watcher=++syncGeneration;
+
+  // RPC sync is intentionally separate from the GPU loop.
+  // A slow RPC response can no longer pause hashing.
+  while(mining && generation===miningGeneration && watcher===syncGeneration){
+    const before=currentChallenge;
     try{
-      if(Date.now()-lastChainRead>800){
-        const state=await refreshChain(true);
-        if(!state.active){stopMining(false);log("Mining is not active on-chain.","warn");break;}
+      const [challenge,target,mined] = await Promise.all([
+        hashpixelsRead.currentChallenge(),
+        hashpixelsRead.getFunction("target").staticCall(),
+        hashpixelsRead.totalMined()
+      ]);
+
+      if(!mining || generation!==miningGeneration)break;
+
+      currentChallenge=challenge;
+      currentTarget=target;
+      currentDifficulty=ethers.MaxUint256/target;
+      lastChainRead=Date.now();
+
+      $("challengeLine").textContent="challenge: "+challenge;
+      $("challengeFull").textContent=challenge;
+      $("targetShort").textContent=short("0x"+target.toString(16).padStart(64,"0"),10,8);
+      $("difficulty").textContent=Number(currentDifficulty)>=1e9
+        ?(Number(currentDifficulty)/1e9).toFixed(2)+"B"
+        :fmt(currentDifficulty.toString());
+      $("bitsLabel").textContent="DIFFICULTY "+(Number(currentDifficulty)/1e9).toFixed(2)+"B";
+      $("mined").textContent=fmt(mined.toString());
+      $("remaining").textContent=fmt((4444n-mined).toString());
+      $("tickerMined").textContent=fmt(mined.toString())+" / 4,444 mined";
+
+      if(before!==ethers.ZeroHash && challenge.toLowerCase()!==before.toLowerCase()){
+        log("New on-chain challenge detected. GPU switched automatically.","good");
       }
-      const challenge=currentChallenge,target=currentTarget,dp=selectedDP;
-      const start=nonceCursor;
-      const settings=powerSettings();
-      batchSize=Math.min(batchSize,settings.max);
-      $("batchBar").style.width="55%";
-      const r=await runBatch(challenge,target,start,batchSize,dp);
-      if(!mining)break;
-      hashesTested+=BigInt(batchSize);
-      nonceCursor=(nonceCursor+BigInt(batchSize))&((1n<<64n)-1n);
-      lastHashrate=batchSize/(Math.max(r.ms,1)/1000);
-      $("hashrate").textContent=formatRate(lastHashrate);
-      $("tested").textContent=fmt(hashesTested.toString());
-      $("batchMs").textContent=r.ms.toFixed(1)+" ms";
-      $("batchBar").style.width="100%";
+
       updateProbability();
-      const desired=Math.max(4096,Math.min(settings.max,Math.round(batchSize*(settings.targetMs/Math.max(r.ms,10)))));
-      batchSize=Math.max(WORKGROUP,Math.floor(desired/WORKGROUP)*WORKGROUP);
+    }catch(e){
+      const now=Date.now();
+      if(!window.__lastWatcherWarn || now-window.__lastWatcherWarn>20000){
+        log("RPC sync delayed. GPU keeps hashing continuously; retrying in background.","warn");
+        window.__lastWatcherWarn=now;
+      }
+      console.warn("HASHPIXELS background sync:",e);
+    }
+
+    // Robinhood Chain is fast, but this polling never blocks the GPU pipeline.
+    await sleep(1200);
+  }
+}
+
+async function miningLoop(generation){
+  const jobs=[];
+
+  const submitNext=(slot)=>{
+    if(!mining || generation!==miningGeneration)return null;
+
+    const challenge=currentChallenge;
+    const target=currentTarget;
+    const dp=selectedDP;
+    const count=Math.min(batchSize,powerSettings().max);
+    const start=nonceCursor;
+
+    nonceCursor=(nonceCursor+BigInt(count))&((1n<<64n)-1n);
+
+    return submitBatch(slot,challenge,target,start,count,dp,generation);
+  };
+
+  try{
+    // Prime all three slots before waiting for any CPU readback.
+    for(const slot of gpu.slots){
+      const job=submitNext(slot);
+      if(job)jobs.push(job);
+    }
+
+    while(mining && generation===miningGeneration && jobs.length){
+      const job=jobs.shift();
+      let r;
+
+      try{
+        r=await job.promise;
+      }catch(e){
+        if(!mining || generation!==miningGeneration)break;
+        throw e;
+      }
+
+      if(!mining || generation!==miningGeneration)break;
+
+      hashesTested+=BigInt(r.count);
+      rateWindowHashes+=BigInt(r.count);
+
+      const now=performance.now();
+      const rateElapsed=now-rateWindowStart;
+      if(rateElapsed>=700){
+        const instant=Number(rateWindowHashes)/(rateElapsed/1000);
+        // EMA prevents the displayed hashrate from jumping around.
+        lastHashrate=lastHashrate ? (lastHashrate*0.72+instant*0.28) : instant;
+        rateWindowStart=now;
+        rateWindowHashes=0n;
+        tuneBatchSize();
+      }
+
+      // Refill this slot immediately, before doing non-essential UI work.
+      const replacement=submitNext(r.slot);
+      if(replacement)jobs.push(replacement);
+
+      updateMiningUiSmooth(false);
+
       if(r.nonce!==null){
         const proof=ethers.solidityPackedKeccak256(
           ["bytes32","address","uint256","uint256"],
-          [challenge,walletAddress,dp,r.nonce]
+          [r.challenge,walletAddress,r.dpId,r.nonce]
         );
-        if(BigInt(proof)<=target && proof.toLowerCase()===r.hash.toLowerCase()){
-          const live=await hashpixelsRead.currentChallenge();
-          const owner=await deadPixelsRead.ownerOf(dp);
-          if(live.toLowerCase()===challenge.toLowerCase() && owner.toLowerCase()===walletAddress.toLowerCase()){
-            pendingWinner={nonce:r.nonce,proof,challenge,target,dp};
-            stopMining(false);
+
+        if(BigInt(proof)<=r.target && proof.toLowerCase()===r.hash.toLowerCase()){
+          // Stop submitting new work as soon as a locally valid candidate is found.
+          mining=false;
+          miningGeneration++;
+          syncGeneration++;
+
+          // Winner safety checks may wait on RPC; GPU work is already stopped intentionally.
+          const [live,owner] = await Promise.all([
+            hashpixelsRead.currentChallenge(),
+            deadPixelsRead.ownerOf(r.dpId)
+          ]);
+
+          if(
+            live.toLowerCase()===r.challenge.toLowerCase() &&
+            owner.toLowerCase()===walletAddress.toLowerCase()
+          ){
+            pendingWinner={
+              nonce:r.nonce,
+              proof,
+              challenge:r.challenge,
+              target:r.target,
+              dp:r.dpId
+            };
+            $("minerState").textContent="▪ PROOF FOUND";
+            $("batchBar").style.width="0";
+            updateButtons();
             showWinner();
             log("★ VALID PROOF FOUND ★ nonce "+r.nonce,"good");
-            break;
-          }else{
-            log("Candidate became stale before claim. Continuing on latest challenge.","warn");
-            lastChainRead=0;
+            return;
           }
+
+          // Candidate lost the race: restart smoothly on the newest challenge.
+          log("Valid local proof became stale before claim. Restarting on the new challenge automatically.","warn");
+          await refreshChain(true);
+
+          mining=true;
+          miningGeneration++;
+          const nextGeneration=miningGeneration;
+          rateWindowStart=performance.now();
+          rateWindowHashes=0n;
+          $("minerState").textContent="▪ MINING";
+          updateButtons();
+          miningStateWatcher(nextGeneration);
+          miningLoop(nextGeneration);
+          return;
         }else{
           log("GPU candidate failed CPU safety verification. No transaction requested.","bad");
         }
       }
-      await sleep(0);
-    }catch(e){
-      log("Mining loop error: "+(e.shortMessage||e.message),"bad");
-      console.error(e);await sleep(500);
     }
+  }catch(e){
+    if(!mining || generation!==miningGeneration)return;
+
+    const msg=e?.shortMessage||e?.message||String(e);
+    log("GPU pipeline error: "+msg,"bad");
+    console.error(e);
+
+    // Don't silently spin a broken GPU pipeline.
+    stopMining(false);
+    $("minerState").textContent="▪ GPU ERROR";
   }
 }
+
 function showWinner(){
   $("winDp").textContent="#"+pendingWinner.dp;
   $("winNonce").textContent=pendingWinner.nonce.toString();
