@@ -59,3 +59,14 @@ SMOOTH CONTINUOUS MINER
 - Miner automatically switches to a new challenge detected on-chain.
 - A locally valid but stale proof automatically restarts mining on the latest challenge.
 - Wallet behavior remains manual: no auto-connect, no signatures on load.
+
+
+RPC TRUTH FIX
+- CRITICAL: injected wallet RPC is now signing-only.
+- currentChallenge / target / totalMined always come from the official Robinhood RPC.
+- Fixes the bug where connecting/starting could rewind the UI to an older totalMined value.
+- Monotonic guard rejects any totalMined or L2 block rollback.
+- A stale RPC response can no longer rewind the GPU to an old challenge.
+- Claim performs a fresh canonical chain-state check before requesting a wallet transaction.
+- Stale proofs are discarded instead of allowing repeated CLAIM retries.
+- No contract change and no auto-connect behavior.

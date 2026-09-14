@@ -246,7 +246,7 @@
         </div>
 
         <div class="notice">
-          <strong>Manual wallet only.</strong> This site never auto-connects, never requests a signature on page load, and never asks for a seed phrase or private key. The wallet transaction appears only after your GPU finds a valid proof and you choose to claim it. Chain sync runs independently in the background so RPC latency does not pause GPU hashing.
+          <strong>Manual wallet only.</strong> This site never auto-connects, never requests a signature on page load, and never asks for a seed phrase or private key. The wallet transaction appears only after your GPU finds a valid proof and you choose to claim it. Chain sync runs independently through the official Robinhood RPC; the wallet RPC is never used as the mining source of truth.
         </div>
       </div>
     </div>
@@ -404,6 +404,8 @@ let selectedDP = null, selectedVerified = false;
 let currentChallenge = ethers.ZeroHash, currentTarget = 0n, currentDifficulty = 0n;
 let hashesTested = 0n, nonceCursor = 0n, batchSize = 32768, lastHashrate = 0;
 let pendingWinner = null, lastChainRead = 0;
+let lastAcceptedMined = -1n;
+let lastAcceptedBlock = -1;
 let miningGeneration = 0;
 let syncGeneration = 0;
 let rateWindowStart = 0;
@@ -538,13 +540,14 @@ async function connectWallet(){
 
     deadPixelsWrite=new ethers.Contract(DEAD_PIXELS,DEAD_PIXELS_ABI,signer);
 
-    // Use the connected wallet's RPC for live reads after connection.
-    // This avoids browser CORS / public RPC fetch failures during long mining sessions.
-    hashpixelsRead=new ethers.Contract(HASHPIXELS,HASHPIXELS_ABI,walletProvider);
-    deadPixelsRead=new ethers.Contract(DEAD_PIXELS,DEAD_PIXELS_ABI,walletProvider);
-
+    // IMPORTANT: the injected wallet is used ONLY for signing/writing.
+    // Mining-critical reads intentionally remain on the official Robinhood RPC.
+    // Some injected-wallet RPCs can lag behind the chain and return an old
+    // totalMined/currentChallenge/target, which would make the GPU mine a stale
+    // challenge and cause CLAIM & BURN to revert.
     btn.textContent=short(walletAddress,6,4);
     log("Wallet connected by explicit user action: "+walletAddress,"good");
+    log("Canonical mining state locked to official Robinhood RPC; wallet RPC is signing-only.","good");
 
     if(injectedProvider?.on){
       injectedProvider.on("accountsChanged",()=>location.reload());
@@ -595,6 +598,17 @@ async function refreshChain(silent=true){
       hashpixelsRead.totalMined(),hashpixelsRead.miningBlocksRemaining(),hashpixelsRead.currentDifficulty(),
       rpcProvider.getBlockNumber()
     ]);
+    // totalMined and L2 block height can only move forward.
+    // Never allow an RPC response to rewind the miner to an old challenge.
+    if(lastAcceptedMined >= 0n && mined < lastAcceptedMined){
+      throw new Error(`STALE RPC STATE REJECTED: totalMined ${mined} < ${lastAcceptedMined}`);
+    }
+    if(lastAcceptedBlock >= 0 && bn < lastAcceptedBlock){
+      throw new Error(`STALE RPC BLOCK REJECTED: L2 ${bn} < ${lastAcceptedBlock}`);
+    }
+    lastAcceptedMined=mined;
+    lastAcceptedBlock=bn;
+
     currentChallenge=challenge;currentTarget=target;currentDifficulty=diff;
     $("networkStatus").textContent=active?"LIVE":"NOT ACTIVE";
     $("networkStatus").style.color=active?"var(--green)":"var(--yellow)";
@@ -616,7 +630,10 @@ async function refreshChain(silent=true){
     }
     return {active,challenge,target,mined,remaining,diff,bn};
   }catch(e){
-    if(!silent)log("Chain read failed: "+(e.shortMessage||e.message),"bad");
+    $("networkStatus").textContent="SYNCING";
+    $("networkStatus").style.color="var(--yellow)";
+    updateButtons();
+    if(!silent)log("Canonical chain read failed: "+(e.shortMessage||e.message),"bad");
     throw e;
   }
 }
@@ -925,10 +942,23 @@ async function miningStateWatcher(generation){
 
       if(!mining || generation!==miningGeneration)break;
 
+      if(lastAcceptedMined >= 0n && mined < lastAcceptedMined){
+        const now=Date.now();
+        if(!window.__lastStaleRpcWarn || now-window.__lastStaleRpcWarn>10000){
+          log(`STALE RPC IGNORED: node reported ${mined} mined, last accepted is ${lastAcceptedMined}. GPU was NOT rewound.`,"warn");
+          window.__lastStaleRpcWarn=now;
+        }
+        await sleep(700);
+        continue;
+      }
+
+      lastAcceptedMined=mined;
       currentChallenge=challenge;
       currentTarget=target;
       currentDifficulty=ethers.MaxUint256/target;
       lastChainRead=Date.now();
+      $("networkStatus").textContent="LIVE";
+      $("networkStatus").style.color="var(--green)";
 
       $("challengeLine").textContent="challenge: "+challenge;
       $("challengeFull").textContent=challenge;
@@ -949,7 +979,7 @@ async function miningStateWatcher(generation){
     }catch(e){
       const now=Date.now();
       if(!window.__lastWatcherWarn || now-window.__lastWatcherWarn>20000){
-        log("RPC sync delayed. GPU keeps hashing continuously; retrying in background.","warn");
+        log("Official RPC sync delayed. Last accepted challenge retained; retrying in background.","warn");
         window.__lastWatcherWarn=now;
       }
       console.warn("HASHPIXELS background sync:",e);
@@ -1096,8 +1126,14 @@ async function claimWinner(){
   if(!pendingWinner||claiming)return;
   claiming=true;$("claimBtn").disabled=true;
   try{
-    const liveChallenge=await hashpixelsRead.currentChallenge();
-    if(liveChallenge.toLowerCase()!==pendingWinner.challenge.toLowerCase())throw new Error("Proof is stale — another miner already advanced the challenge.");
+    // HARD preflight against the official canonical RPC immediately before
+    // requesting a wallet transaction. If fresh state cannot be confirmed,
+    // do not ask the wallet to submit anything.
+    const fresh=await refreshChain(true);
+    const liveChallenge=fresh.challenge;
+    if(liveChallenge.toLowerCase()!==pendingWinner.challenge.toLowerCase()){
+      throw new Error("STALE PROOF — another miner already advanced the challenge. No transaction was requested.");
+    }
     const owner=await deadPixelsRead.ownerOf(pendingWinner.dp);
     if(owner.toLowerCase()!==walletAddress.toLowerCase())throw new Error("Connected wallet no longer owns the selected DEAD PIXELS.");
     const proof=ethers.solidityPackedKeccak256(["bytes32","address","uint256","uint256"],
@@ -1129,7 +1165,19 @@ async function claimWinner(){
       }catch{}
     }
   }catch(e){
-    log("Claim failed: "+(e.shortMessage||e.message),"bad");
+    const msg=e?.shortMessage||e?.message||String(e);
+    log("Claim failed: "+msg,"bad");
+
+    // If the proof is stale, destroy the dead proof immediately so the user
+    // cannot retry it over and over. The DEAD PIXELS remains in the wallet.
+    try{
+      const fresh=await refreshChain(true);
+      if(pendingWinner && fresh.challenge.toLowerCase()!==pendingWinner.challenge.toLowerCase()){
+        log("STALE PROOF discarded. DEAD PIXELS was NOT burned. Mine the new challenge.","warn");
+        pendingWinner=null;
+        $("winnerModal").classList.remove("show");
+      }
+    }catch{}
   }finally{
     claiming=false;$("claimBtn").disabled=false;updateButtons();
   }
